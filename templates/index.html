@@ -181,36 +181,6 @@
             letter-spacing: .04em;
         }
 
-        .team-PPT {
-            background: rgba(139, 92, 246, .25);
-            color: #c4b5fd;
-        }
-
-        .team-RamSurya {
-            background: rgba(244, 63, 94, .2);
-            color: #fda4af;
-        }
-
-        .team-RSK {
-            background: rgba(34, 197, 94, .2);
-            color: #86efac;
-        }
-
-        .team-CNI {
-            background: rgba(59, 130, 246, .2);
-            color: #93c5fd;
-        }
-
-        .team-GKKani {
-            background: rgba(251, 191, 36, .2);
-            color: #fcd34d;
-        }
-
-        .team-Unknown {
-            background: rgba(148, 163, 184, .15);
-            color: #94a3b8;
-        }
-
         .clickable-row {
             cursor: pointer;
         }
@@ -855,15 +825,22 @@
                     <div class="mb-3">
                         <label class="form-label text-secondary fw-semibold" style="font-size:.85rem;">Tournament ID
                             (slug)</label>
-                        <input type="text" class="form-control" id="newTournamentId" placeholder="e.g. wt20_2026"
+                        <input type="text" class="form-control" id="newTournamentId" placeholder="e.g. ipl_2025"
                             style="background:rgba(255,255,255,.06);border:1px solid var(--card-border);color:#fff;border-radius:12px;padding:.65rem 1rem;">
                     </div>
                     <div class="mb-3">
                         <label class="form-label text-secondary fw-semibold" style="font-size:.85rem;">Display
                             Name</label>
                         <input type="text" class="form-control" id="newTournamentName"
-                            placeholder="e.g. ICC T20 World Cup 2026"
+                            placeholder="e.g. Indian Premier League 2025"
                             style="background:rgba(255,255,255,.06);border:1px solid var(--card-border);color:#fff;border-radius:12px;padding:.65rem 1rem;">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-secondary fw-semibold" style="font-size:.85rem;">Cricinfo Series URL <span class="text-secondary" style="font-weight:400;">(optional — enables auto-scrape)</span></label>
+                        <input type="url" class="form-control" id="newTournamentSeriesUrl"
+                            placeholder="https://www.espncricinfo.com/series/...(series-id)/match-results"
+                            style="background:rgba(255,255,255,.06);border:1px solid var(--card-border);color:#fff;border-radius:12px;padding:.65rem 1rem;">
+                        <div class="form-text text-secondary" style="font-size:.75rem;">Paste the Cricinfo series results page URL to enable daily auto-import of new matches.</div>
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -1006,8 +983,16 @@
         function showEl(el) { if (el) el.style.display = ''; }
         function hideEl(el) { if (el) el.style.display = 'none'; }
         function teamBadge(team) {
-            const cls = 'team-badge team-' + (team || 'Unknown').replace(/\s+/g, '');
-            return `<span class="${cls}">${team || '—'}</span>`;
+            const name = team || 'Unknown';
+            // Generate a consistent hue from the team name
+            let hash = 0;
+            for (let i = 0; i < name.length; i++) {
+                hash = name.charCodeAt(i) + ((hash << 5) - hash);
+            }
+            const hue = ((hash % 360) + 360) % 360;
+            const bg = `hsla(${hue}, 70%, 60%, 0.2)`;
+            const fg = `hsl(${hue}, 80%, 75%)`;
+            return `<span class="team-badge" style="background:${bg};color:${fg}">${name}</span>`;
         }
         function api(path) {
             if (!tournamentSlug) throw new Error('No tournament selected');
@@ -1120,18 +1105,23 @@
         function openCreateTournamentModal() {
             document.getElementById('newTournamentId').value = '';
             document.getElementById('newTournamentName').value = '';
+            const seriesEl = document.getElementById('newTournamentSeriesUrl');
+            if (seriesEl) seriesEl.value = '';
             new bootstrap.Modal(document.getElementById('createTournamentModal')).show();
         }
 
         function createTournament() {
             const tid = document.getElementById('newTournamentId').value.trim();
             const name = document.getElementById('newTournamentName').value.trim();
+            const seriesEl = document.getElementById('newTournamentSeriesUrl');
+            const seriesUrl = seriesEl ? seriesEl.value.trim() : '';
+            
             if (!tid || !name) { alert('Both fields required'); return; }
 
             fetch('/tournaments', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ tournament_id: tid, name: name }),
+                body: JSON.stringify({ tournament_id: tid, name: name, series_url: seriesUrl }),
             })
                 .then(r => r.json())
                 .then(d => {
@@ -1489,12 +1479,8 @@
             row.id = 'matchEntry' + id;
             row.innerHTML = `
                 <div class="flex-grow-1">
-                    <label class="form-label">Cricbuzz Match ID</label>
-                    <input type="text" class="form-control match-id-field" placeholder="e.g. 139373">
-                </div>
-                <div class="flex-grow-1">
-                    <label class="form-label">Cricinfo Full Scorecard URL</label>
-                    <input type="url" class="form-control match-url-field" placeholder="https://...full-scorecard">
+                    <label class="form-label">ESPN Cricinfo Scorecard URL</label>
+                    <input type="url" class="form-control match-url-field" placeholder="https://www.espncricinfo.com/series/.../full-scorecard">
                 </div>
                 <button class="btn-remove-entry" title="Remove" onclick="document.getElementById('matchEntry${id}').remove()">✕</button>
             `;
@@ -1505,11 +1491,10 @@
             const rows = document.querySelectorAll('.match-entry-row');
             const entries = [];
             for (const row of rows) {
-                const mid = row.querySelector('.match-id-field').value.trim();
                 const murl = row.querySelector('.match-url-field').value.trim();
-                if (mid && murl) entries.push({ id: mid, url: murl });
+                if (murl) entries.push({ url: murl });
             }
-            if (!entries.length) { alert('Fill at least one match.'); return; }
+            if (!entries.length) { alert('Fill at least one scorecard URL.'); return; }
 
             const btn = document.getElementById('submitAllMatchesBtn');
             const progress = document.getElementById('matchSubmitProgress');
@@ -1522,16 +1507,17 @@
                 const entry = entries[i];
                 const logItem = document.createElement('div');
                 logItem.className = 'log-item log-loading';
-                logItem.textContent = `[${i + 1}/${entries.length}] Fetching match ${entry.id}...`;
+                logItem.textContent = `[${i + 1}/${entries.length}] Fetching match...`;
                 progress.appendChild(logItem);
                 progress.scrollTop = progress.scrollHeight;
 
                 try {
-                    const url = api('/match/' + encodeURIComponent(entry.id)) + '?cricinfo_url=' + encodeURIComponent(entry.url);
+                    const url = api('/match/auto') + '?scorecard_url=' + encodeURIComponent(entry.url);
                     const resp = await fetch(url);
                     if (!resp.ok) throw new Error(await resp.text());
+                    const data = await resp.json();
                     logItem.className = 'log-item log-success';
-                    logItem.textContent = `[${i + 1}/${entries.length}] ✅ Match ${entry.id} fetched`;
+                    logItem.textContent = `[${i + 1}/${entries.length}] ✅ ${data.match_name || 'Match'} fetched`;
                 } catch (err) {
                     logItem.className = 'log-item log-error';
                     logItem.textContent = `[${i + 1}/${entries.length}] ❌ ${err.message}`;

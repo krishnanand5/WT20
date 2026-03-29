@@ -46,7 +46,7 @@ def get_db():
 # Tournament helpers
 # ---------------------------------------------------------------------------
 
-def create_tournament(tournament_id, name, players=None):
+def create_tournament(tournament_id, name, players=None, series_url=""):
     """Create a new tournament. players is a list of {player_name, team} dicts."""
     db = get_db()
     if db.tournaments.find_one({"tournament_id": tournament_id}):
@@ -55,6 +55,7 @@ def create_tournament(tournament_id, name, players=None):
         "tournament_id": tournament_id,
         "name": name,
         "players": players or [],
+        "series_url": series_url or "",
     }
     db.tournaments.insert_one(doc)
     return doc
@@ -67,17 +68,27 @@ def get_tournament(tournament_id):
 
 
 def list_tournaments():
-    """Return all tournaments (summary: id, name, player count)."""
+    """Return all tournaments (summary: id, name, player count, series_url)."""
     db = get_db()
-    docs = db.tournaments.find({}, {"_id": 0, "tournament_id": 1, "name": 1, "players": 1})
+    docs = db.tournaments.find({}, {"_id": 0, "tournament_id": 1, "name": 1, "players": 1, "series_url": 1})
     results = []
     for doc in docs:
         results.append({
             "tournament_id": doc["tournament_id"],
             "name": doc.get("name", doc["tournament_id"]),
             "player_count": len(doc.get("players", [])),
+            "series_url": doc.get("series_url", ""),
         })
     return results
+
+
+def update_tournament_series_url(tournament_id, series_url):
+    """Update the Cricinfo series URL for a tournament."""
+    db = get_db()
+    db.tournaments.update_one(
+        {"tournament_id": tournament_id},
+        {"$set": {"series_url": series_url}},
+    )
 
 
 def update_tournament_name(tournament_id, name):

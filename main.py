@@ -1,11 +1,16 @@
 import csv
 import io
+import threading
+from datetime import datetime
 
 from flask import Flask, jsonify, render_template, request
 
 from calculate_points import recalculate_all
 
 app = Flask(__name__)
+
+# Store last auto-scrape results in memory
+_last_auto_scrape = {"results": [], "timestamp": None}
 
 
 # ---------------------------------------------------------------------------
@@ -29,10 +34,25 @@ def create_tournament_endpoint():
     if not tid or not name:
         return jsonify({"error": "tournament_id and name are required"}), 400
     try:
-        create_tournament(tid, name, data.get("players"))
+        series_url = (data.get("series_url") or "").strip()
+        create_tournament(tid, name, data.get("players"), series_url=series_url)
         return jsonify({"status": "ok", "tournament_id": tid})
     except ValueError as e:
         return jsonify({"error": str(e)}), 409
+
+
+@app.route('/tournaments/<slug>', methods=['PUT'])
+def update_tournament_endpoint(slug):
+    """Update a tournament. Body: {series_url?}."""
+    from db import get_tournament, update_tournament_series_url
+    t = get_tournament(slug)
+    if not t:
+        return jsonify({"error": "Tournament not found"}), 404
+    data = request.get_json(force=True)
+    series_url = data.get("series_url")
+    if series_url is not None:
+        update_tournament_series_url(slug, series_url.strip())
+    return jsonify({"status": "ok"})
 
 
 @app.route('/tournaments/<slug>', methods=['DELETE'])
@@ -114,20 +134,25 @@ def remove_player_endpoint(slug, player_name):
 
 @app.route('/t/<slug>/match/<match_id>', methods=['GET'])
 def get_match_endpoint(slug, match_id):
-    """Return match data. If not found and cricinfo_url is provided, scrape it."""
-    if not match_id.isdigit():
-        return jsonify({"error": "match_id must be numeric"}), 400
+    """Return match data. If not found, scrape from Cricinfo scorecard URL."""
     from db import get_match, save_match
 
     doc = get_match(slug, match_id)
     if doc:
         return jsonify(doc)
 
-    # Try to scrape
-    cricinfo_url = request.args.get("cricinfo_url", "").strip()
+    # Need a scorecard URL to scrape
+    scorecard_url = request.args.get("scorecard_url", "").strip()
+    if not scorecard_url:
+        return jsonify({"error": "scorecard_url query param required (ESPN Cricinfo full-scorecard URL)"}), 400
+
+    # Scrape from Cricinfo
     try:
         from scrape_match import scrape_match
-        match_data, vs_portion = scrape_match(match_id, cricinfo_url or None)
+        match_data, vs_portion = scrape_match(scorecard_url)
+        # Override match_id if user provided one in the URL path
+        if match_id:
+            match_data["match_id"] = str(match_id)
         save_match(slug, match_data)
         # Auto-recalculate
         try:
@@ -137,6 +162,40 @@ def get_match_endpoint(slug, match_id):
         return jsonify(match_data)
     except Exception as e:
         return jsonify({"error": "Scrape failed: {}".format(str(e))}), 500
+
+
+@app.route('/t/<slug>/match/auto', methods=['GET'])
+def auto_scrape_match(slug):
+    """Scrape a match from a Cricinfo scorecard URL (auto-extracts match_id).
+
+    Used by the UI to add matches with just a URL — no manual ID needed.
+    """
+    from db import get_match, save_match
+
+    scorecard_url = request.args.get("scorecard_url", "").strip()
+    if not scorecard_url:
+        return jsonify({"error": "scorecard_url query param required"}), 400
+
+    try:
+        from scrape_match import scrape_match
+        match_data, vs_portion = scrape_match(scorecard_url)
+
+        # Check if this match already exists
+        match_id = match_data.get("match_id", "")
+        existing = get_match(slug, match_id) if match_id else None
+        if existing:
+            return jsonify(existing)
+
+        save_match(slug, match_data)
+        # Auto-recalculate fantasy points
+        try:
+            recalculate_all(slug)
+        except Exception as e:
+            print("Warning: recalculate failed: {}".format(e))
+        return jsonify(match_data)
+    except Exception as e:
+        return jsonify({"error": "Scrape failed: {}".format(str(e))}), 500
+
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +274,75 @@ def fantasy_delete_match(slug, match_id):
 
 
 # ---------------------------------------------------------------------------
+# Auto-scrape endpoints
+# ---------------------------------------------------------------------------
+
+@app.route('/auto-scrape/trigger', methods=['POST'])
+def trigger_auto_scrape():
+    """Manually trigger the auto-scrape agent."""
+    global _last_auto_scrape
+    try:
+        from auto_scrape import check_all_tournaments
+        results = check_all_tournaments()
+        _last_auto_scrape = {
+            "results": results,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        total_new = sum(len(r["new_matches"]) for r in results)
+        return jsonify({
+            "status": "ok",
+            "tournaments_checked": len(results),
+            "new_matches": total_new,
+            "details": results,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/auto-scrape/status', methods=['GET'])
+def auto_scrape_status():
+    """Return the last auto-scrape run results."""
+    return jsonify(_last_auto_scrape)
+
+
+@app.route('/auto-scrape/test-scheduler', methods=['POST'])
+def test_scheduler_endpoint():
+    """Schedule a one-off auto-scrape run 10 seconds from now to test APScheduler."""
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from datetime import datetime, timedelta
+        
+        # We need the global scheduler instance to add a job to it dynamically,
+        # but since we create it in _start_scheduler, the easiest way to test
+        # without global variable refactoring is to just run a thread with a delay.
+        # However, to explicitly test APScheduler itself works:
+        global _scheduler
+        if not _scheduler:
+            return jsonify({"error": "Scheduler not running"}), 500
+            
+        run_time = datetime.now() + timedelta(seconds=10)
+        
+        def _test_job():
+            global _last_auto_scrape
+            print(f"\\n[{datetime.now().isoformat()}] 🕒 TEST SCHEDULER FIRED!")
+            try:
+                from auto_scrape import check_all_tournaments
+                with app.app_context():
+                    results = check_all_tournaments()
+                    _last_auto_scrape = {
+                        "results": results,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }
+            except Exception as e:
+                print(f"Auto-scrape test error: {e}")
+                
+        _scheduler.add_job(_test_job, 'date', run_date=run_time, id='test_run')
+        return jsonify({"status": "ok", "message": "Auto-scrape scheduled to run in 10 seconds. Check terminal logs."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
 # Frontend
 # ---------------------------------------------------------------------------
 
@@ -223,5 +351,49 @@ def website():
     return render_template('index.html')
 
 
+# ---------------------------------------------------------------------------
+# APScheduler — runs auto-scrape at 00:15 IST daily
+# ---------------------------------------------------------------------------
+
+_scheduler = None
+
+def _start_scheduler():
+    """Start APScheduler for the daily auto-scrape job."""
+    global _scheduler
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        import pytz
+    except ImportError:
+        print("⚠️  APScheduler not installed — daily auto-scrape disabled.")
+        print("   Install with: pip install APScheduler pytz")
+        return
+
+    def _scheduled_job():
+        global _last_auto_scrape
+        try:
+            from auto_scrape import check_all_tournaments
+            with app.app_context():
+                results = check_all_tournaments()
+                _last_auto_scrape = {
+                    "results": results,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+        except Exception as e:
+            print(f"Auto-scrape error: {e}")
+
+    ist = pytz.timezone("Asia/Kolkata")
+    _scheduler = BackgroundScheduler()
+    _scheduler.add_job(
+        _scheduled_job,
+        CronTrigger(hour=0, minute=15, timezone=ist),
+        id="auto_scrape_daily",
+        name="Daily auto-scrape at 00:15 IST",
+    )
+    _scheduler.start()
+    print("✅ APScheduler started: auto-scrape at 00:15 IST daily")
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    _start_scheduler()
+    app.run(debug=True, use_reloader=False)
